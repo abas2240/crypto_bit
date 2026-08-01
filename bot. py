@@ -1,0 +1,101 @@
+import logging
+import ccxt
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+
+# تنظیمات لاگینگ برای مانیتورینگ
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_BOT_TOKEN = "8809462962:AAFwmQLif2VyNbO-OmVXgrWLuDI2WojQHEE"
+
+EXCHANGES_FUTURES = ['toobit', 'coinex', 'kucoin']
+EXCHANGES_SPOT = ['okx', 'coinbase', 'coinex', 'kucoin']
+last_signals_cache = {}
+
+def calculate_18_indicators_and_filter_fake(df):
+    try:
+        df['RSI'] = ta.rsi(df['close'], length=14)
+        stoch = ta.stoch(df['high'], df['low'], df['close'])
+        df['STOCHk'] = stoch.iloc[:, 0]
+        df['STOCHd'] = stoch.iloc[:, 1]
+        macd = ta.macd(df['close'])
+        df['MACD'] = macd.iloc[:, 0]
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        is_stoch_fake = False
+        if last['STOCHk'] > 80 and last['STOCHd'] > 80 and last['MACD'] < prev['MACD']:
+            is_stoch_fake = True
+        elif last['STOCHk'] < 20 and last['STOCHd'] < 20 and last['MACD'] > prev['MACD']:
+            is_stoch_fake = True
+
+        if is_stoch_fake:
+            return False, last['close'], last['volume'], last['RSI'], 0
+
+        return True, last['close'], last['volume'], last['RSI'], 16
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return False, 0, 0, 0, 0
+
+def fetch_and_analyze_market(exchange_names, symbol="PEPE/USDT"):
+    for name in exchange_names:
+        try:
+            exchange_class = getattr(ccxt, name)
+            exchange = exchange_class({'enableRateLimit': True})
+            exchange.load_markets()
+            if symbol in exchange.markets:
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                is_valid, price, volume, rsi, score = calculate_18_indicators_and_filter_fake(df)
+                if not is_valid:
+                    continue
+                ticker = exchange.fetch_ticker(symbol)
+                return name.upper(), price, ticker.get('quoteVolume', volume), rsi, score
+        except Exception as e:
+            continue
+    return None, 0, 0, 0, 0
+
+def format_price(price):
+    if price < 0.0001:
+        return f"{price:.8f}"
+    elif price < 1:
+        return f"{price:.4f}"
+    else:
+        return f"{price:.2f}"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("سلام! ربات تحلیل‌گر شما فعال و آماده به کار است 🤖")
+
+async def get_futures_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol = "PEPE/USDT"
+    exchange_used, raw_price, volume, rsi_val, score = fetch_and_analyze_market(EXCHANGES_FUTURES, symbol)
+    if not exchange_used or score == 0:
+        await update.message.reply_text("❌ سیگنالی تایید نشد.")
+        return
+    await update.message.reply_text(f"🚀 سیگنال فیوچرز\nصرافی: {exchange_used}\nقیمت: `{format_price(raw_price)}`", parse_mode="Markdown")
+
+async def get_spot_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol = "SHIB/USDT"
+    exchange_used, raw_price, volume, rsi_val, score = fetch_and_analyze_market(EXCHANGES_SPOT, symbol)
+    if not exchange_used or score == 0:
+        await update.message.reply_text("❌ سیگنالی تایید نشد.")
+        return
+    await update.message.reply_text(f"💎 سیگنال اسپات\nصرافی: {exchange_used}\nقیمت: `{format_price(raw_price)}`", parse_mode="Markdown")
+
+def main():
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("futures", get_futures_signal))
+    application.add_handler(CommandHandler("spot", get_spot_signal))
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
